@@ -71,9 +71,14 @@ async def analyze_code(request_body: Dict):
                 ref,
                 pusher,
             )
-            issue_url = issue_res["html_url"]
+            # 优先使用 html_url，如果没有则使用 url
+            issue_url = issue_res.get("html_url") or issue_res.get("url")
+            if not issue_url:
+                logger.error("Failed to get issue URL from response")
+                issue_url = f"{config.gitea_host}/Infrastructure/IaC/issues/{issue_res['number']}"
+            
             current_issue_id = issue_res["number"]
-
+            
             logger.success(f"The code review: {issue_url}")
 
             # Send a notification to the webhook

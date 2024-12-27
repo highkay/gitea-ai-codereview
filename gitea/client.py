@@ -6,12 +6,12 @@ from utils import logger
 
 class GiteaClient:
     def __init__(self, host: str, token: str):
-        self.host = host
+        self.host = host.rstrip('/')
         self.token = token
 
     def get_diff_blocks(self, owner: str, repo: str, sha: str) -> str:
         # Get the diff of the commit
-        endpoint = f"https://{self.host}/api/v1/repos/{owner}/{repo}/git/commits/{sha}.diff?access_token={self.token}"
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/git/commits/{sha}.diff?access_token={self.token}"
         res = requests.get(endpoint)
         if res.status_code == 200 and res.text != "":
             diff_blocks = re.split("diff --git ", res.text.strip())
@@ -27,15 +27,15 @@ class GiteaClient:
     def create_issue(
         self, owner: str, repo: str, title: str, body: str, ref: str, pusher: str
     ):
-        endpoint = f"https://{self.host}/api/v1/repos/{owner}/{repo}/issues?access_token={self.token}"
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/issues?access_token={self.token}"
         data = {
-            "assignee": "jenkins",
+            "assignee": pusher,
             "assignees": [pusher],
             "body": body,
             "closed": False,
             "due_date": None,
-            "labels": [0],
-            "milestone": 0,
+            "labels": [],
+            "milestone": None,
             "ref": ref,
             "title": title,
         }
@@ -43,10 +43,11 @@ class GiteaClient:
         if res.status_code == 201:
             return res.json()
         else:
+            logger.error(f"Failed to create issue: {res.text}")
             return None
 
     def add_issue_comment(self, owner, repo, issue_id, comment):
-        endpoint = f"https://{self.host}/api/v1/repos/{owner}/{repo}/issues/{issue_id}/comments?access_token={self.token}"
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/issues/{issue_id}/comments?access_token={self.token}"
         data = {
             "body": comment,
         }
