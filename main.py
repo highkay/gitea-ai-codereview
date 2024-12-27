@@ -4,6 +4,7 @@ from typing import Dict
 
 import requests
 from codereview.copilot import Copilot
+from codereview.deepseek import DeepSeek
 from gitea.client import GiteaClient
 from utils.config import Config
 from utils.logger import logger, setup_logging
@@ -17,7 +18,15 @@ config = Config()
 
 gitea_clinet = GiteaClient(config.gitea_host, config.gitea_token)
 
-copilot = Copilot(config.copilot_token)
+# 根据配置动态选择 AI 实例
+if config.copilot_token:
+    ai = Copilot(config.copilot_token)
+    logger.info("Using Copilot for code review")
+elif config.deepseek_key:
+    ai = DeepSeek(config.deepseek_key)
+    logger.info("Using DeepSeek for code review")
+else:
+    raise ValueError("No AI service configured. Please set either COPILOT_TOKEN or DEEPSEEK_KEY")
 
 
 @app.post("/codereview")
@@ -49,8 +58,8 @@ async def analyze_code(request_body: Dict):
                     logger.warning(f"File {file_name} is ignored")
                     continue
 
-        # Send the diff to ChatGPT for code analysis)
-        response = copilot.code_review(diff_content)
+        # 使用选定的 AI 实例进行代码审查
+        response = ai.code_review(diff_content)
 
         comment = create_comment(file_name, diff_content, response)
         if i == 1:
@@ -98,12 +107,12 @@ async def analyze_code(request_body: Dict):
         logger.info("Sleep for 1.5 seconds...")
         sleep(1.5)
 
-    # add banner to the issue
+    # 添加对应 AI 的横幅
     gitea_clinet.add_issue_comment(
         owner,
         repo,
         current_issue_id,
-        copilot.banner,
+        ai.banner,
     )
 
     return {"message": response}
@@ -112,7 +121,7 @@ async def analyze_code(request_body: Dict):
 @app.post("/test")
 def test(request_body: str):
     logger.success("Test")
-    return {"message": copilot.code_review(request_body)}
+    return {"message": ai.code_review(request_body)}
 
 
 if __name__ == "__main__":
