@@ -10,6 +10,7 @@ class Config:
         self.gitea_host: str = os.getenv("GITEA_HOST")
         self.openai_key: str = os.getenv("OPENAI_KEY")
         self.copilot_token: str = os.getenv("COPILOT_TOKEN")
+        self.deepseek_key: str = os.getenv("DEEPSEEK_KEY")
         self.ignored_file_suffix: str = os.getenv("IGNORED_FILE_SUFFIX")
         webhook: Webhook = Webhook()
         webhook.url = os.getenv("WEBHOOK_URL")
@@ -24,8 +25,8 @@ class Config:
             raise ValueError("GITEA_TOKEN is required")
         if not self.gitea_host:
             raise ValueError("GITEA_HOST is required")
-        if not self.copilot_token:
-            raise ValueError("COPILOT_TOKEN is required")
+        if not (self.copilot_token or self.deepseek_key):
+            raise ValueError("Either COPILOT_TOKEN or DEEPSEEK_KEY is required")
 
 
 class Webhook:

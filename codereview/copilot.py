@@ -36,6 +36,7 @@ class Copilot(AI):
             "editor-plugin-version": "copilot-chat/0.16.1",
         }
 
+
         # Set the data for the API request
         data = {
             "messages": [
