@@ -1,13 +1,21 @@
 import re
 import requests
+from typing import List, Dict, Optional
 
-from utils import logger
+from utils.logger import logger
 
 
 class GiteaClient:
     def __init__(self, host: str, token: str):
+        """初始化 Gitea 客户端
+        
+        Args:
+            host (str): Gitea 服务器地址
+            token (str): 访问令牌
+        """
         self.host = host.rstrip('/')
         self.token = token
+        self.headers = {"Authorization": f"token {self.token}"}
 
     def get_diff_blocks(self, owner: str, repo: str, sha: str) -> str:
         # Get the diff of the commit
@@ -70,3 +78,191 @@ class GiteaClient:
         commit_url = request_body["commits"][0]["url"]
 
         return owner, repo, sha, ref, pusher, full_name, title, commit_url
+
+    def get_pr_diff(self, owner: str, repo: str, pr_number: int) -> List[str]:
+        """获取PR的所有差异内容，过滤掉SQL文件
+        
+        Args:
+            owner (str): 仓库所有者
+            repo (str): 仓库名称
+            pr_number (int): PR编号
+            
+        Returns:
+            List[str]: 差异内容列表
+        """
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}.diff"
+        
+        try:
+            response = requests.get(endpoint, headers=self.headers)
+            response.raise_for_status()
+            
+            if response.text:
+                diff_blocks = re.split("diff --git ", response.text.strip())
+                # 过滤空字符串和SQL文件
+                diff_blocks = [
+                    block for block in diff_blocks 
+                    if block and not any(f.endswith('.sql') for f in block.split('\n', 1))
+                ]
+                logger.debug(f"获取到 {len(diff_blocks)} 个差异块")
+                return diff_blocks
+            logger.warning("PR没有差异内容")
+            return []
+        except Exception as e:
+            logger.error(f"获取PR差异失败: {str(e)}")
+            return []
+
+    def get_pr_commits(self, owner: str, repo: str, pr_number: int) -> list:
+        """获取PR中的所有commit信息
+        
+        API: GET /repos/{owner}/{repo}/pulls/{index}/commits
+        """
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/commits"
+        
+        try:
+            response = requests.get(endpoint, headers=self.headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"获取PR commits失败: {str(e)}")
+            return []
+
+    def approve_pr(self, owner: str, repo: str, pr_number: int) -> bool:
+        """批准PR
+        
+        Args:
+            owner (str): 仓库所有者
+            repo (str): 仓库名称
+            pr_number (int): PR编号
+            
+        Returns:
+            bool: 是否成功
+        """
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+        data = {
+            "body": "代码审查通过",
+            "state": "APPROVED"
+        }
+        
+        try:
+            response = requests.post(endpoint, headers=self.headers, json=data)
+            response.raise_for_status()
+            logger.info(f"已批准PR #{pr_number}")
+            return True
+        except Exception as e:
+            logger.error(f"批准PR失败: {str(e)}")
+            return False
+
+    def add_pr_review_comment(self, owner: str, repo: str, pr_number: int, review_result: Dict) -> bool:
+        """添加PR评论并设置审查状态
+        
+        Args:
+            owner (str): 仓库所有者
+            repo (str): 仓库名称
+            pr_number (int): PR编号
+            review_result (dict): 审查结果
+            
+        Returns:
+            bool: 是否成功
+        """
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+        
+        comment = self._format_review_comment(review_result)
+        
+        # 根据审查结果决定状态
+        state = "APPROVED" if not review_result['needs_review'] else "COMMENT"
+        
+        data = {
+            "body": comment,
+            "state": state
+        }
+        
+        try:
+            response = requests.post(endpoint, headers=self.headers, json=data)
+            response.raise_for_status()
+            logger.info(f"已添加PR #{pr_number} 的评论和状态: {state}")
+            return True
+        except Exception as e:
+            logger.error(f"添加PR评论和状态失败: {str(e)}")
+            return False
+
+    def _format_review_comment(self, review_result: Dict) -> str:
+        """格式化评论内容
+        
+        Args:
+            review_result (dict): 审查结果
+            
+        Returns:
+            str: 格式化后的评论内容
+        """
+        # 评审结果部分使用引用块样式
+        comment = "> # 📊 代码评审结果\n>\n"
+        comment += f"> **总体评分**: {review_result['score']}\n>\n"
+        comment += f"> **状态**: {'✅ 通过' if not review_result['needs_review'] else '❌ 需要修改'}\n>\n"
+        
+        if not review_result['needs_review']:
+            comment += "> 🎉 所有提交的代码质量良好，自动通过审查。\n"
+        else:
+            comment += "> ⚠️ 部分提交需要修改，请查看下方详情。\n"
+        
+        # 提交详情部分使用普通样式
+        comment += "\n---\n\n"
+        comment += "# 📝 提交详情\n\n"
+        
+        for commit_review in review_result['commit_reviews']:
+            status_emoji = "✅" if commit_review['passed'] else "❌"
+            comment += (
+                f"## {status_emoji} Commit [{commit_review['sha'][:7]}]({commit_review['url']})\n\n"
+                f"**提交信息**: {commit_review['message']}\n"
+                f"**评分**: {commit_review['score']}\n"
+                f"**状态**: {'通过' if commit_review['passed'] else '需要修改'}\n\n"
+            )
+            
+            if not commit_review['passed']:
+                for issue in commit_review['issues']:
+                    comment += f"### 🔍 {issue['category']}：{issue['score']}/{issue['max_score']}\n\n"
+                    
+                    for problem in issue['problems']:
+                        severity_emoji = {
+                            'Critical': '🚨',
+                            'High': '⚠️',
+                            'Medium': '⚡',
+                            'Low': 'ℹ️'
+                        }.get(problem['severity'], '🔍')
+                        
+                        comment += f"#### {severity_emoji} {problem['severity']}\n\n"
+                        comment += f"**问题**：{problem['description']}\n\n"
+                        if problem['suggestion']:
+                            comment += f"**建议**：{problem['suggestion']}\n\n"
+                        if problem['example']:
+                            comment += "**示例**：\n```\n" + problem['example'] + "\n```\n\n"
+                    
+                    comment += "---\n\n"
+                    
+        return comment
+
+    def merge_pr(self, owner: str, repo: str, pr_number: int) -> bool:
+        """合并PR
+        
+        Args:
+            owner (str): 仓库所有者
+            repo (str): 仓库名称
+            pr_number (int): PR编号
+            
+        Returns:
+            bool: 是否成功
+        """
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/merge"
+        data = {
+            "Do": "merge",  # 合并方式：merge, rebase, squash, rebase-merge
+            "MergeTitleField": "Merge pull request #{pr_number}",
+            "MergeMessageField": "Automatically merged by code review bot",
+        }
+        
+        try:
+            response = requests.post(endpoint, headers=self.headers, json=data)
+            response.raise_for_status()
+            logger.info(f"已合并PR #{pr_number}")
+            return True
+        except Exception as e:
+            logger.error(f"合并PR失败: {str(e)}")
+            return False

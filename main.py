@@ -3,20 +3,16 @@ from time import sleep
 from typing import Dict
 
 import requests
+from fastapi import FastAPI
 from codereview.copilot import Copilot
 from codereview.deepseek import DeepSeek
 from gitea.client import GiteaClient
 from utils.config import Config
 from utils.logger import logger, setup_logging
-from fastapi import FastAPI
-
-from utils.utils import create_comment, extract_info_from_request
 
 app = FastAPI()
-
 config = Config()
-
-gitea_clinet = GiteaClient(config.gitea_host, config.gitea_token)
+gitea_client = GiteaClient(config.gitea_host, config.gitea_token)
 
 # 根据配置动态选择 AI 实例
 if config.copilot_token:
@@ -28,119 +24,182 @@ elif config.deepseek_key:
 else:
     raise ValueError("No AI service configured. Please set either COPILOT_TOKEN or DEEPSEEK_KEY")
 
-
 @app.post("/codereview")
-async def analyze_code(request_body: Dict):
+async def review_pull_request(request_body: Dict):
+    """处理PR的代码审查请求"""
+    try:
+        # 从请求中提取PR信息
+        logger.debug(f"收到请求体: {request_body}")
+        
+        # 只处理PR打开的事件
+        if request_body.get("action") != "opened":
+            return {"message": "Ignored non-opened PR event"}
+        
+        # 提取PR和仓库信息
+        pr_info = request_body.get("pull_request")
+        repo_info = request_body.get("repository")
+        
+        if not pr_info or not repo_info:
+            raise ValueError("Missing pull_request or repository information")
+        
+        # 从repository的full_name中提取owner和repo
+        repo_full_name = repo_info["full_name"].split("/")
+        owner = repo_full_name[0]
+        repo = repo_full_name[1]
+        pr_number = pr_info["number"]
+        
+        logger.info(f"开始审查 PR #{pr_number} in {owner}/{repo}")
+        logger.info(f"PR标题: {pr_info['title']}")
+        logger.info(f"提交者: {pr_info['user']['login']}")
 
-    owner, repo, sha, ref, pusher, full_name, title, commit_url = (
-        extract_info_from_request(request_body)
-    )
+        # 获取PR中的所有commits
+        commits = gitea_client.get_pr_commits(owner, repo, pr_number)
+        if not commits:
+            logger.warning("未找到PR的commits信息")
+            return {"message": "No commits found"}
 
-    if "[skip codereview]" in title:
-        return {"message": "Skip codereview"}
+        all_reviews = []
+        # 对每个commit进行审查
+        for commit in commits:
+            # 获取commit的差异内容
+            diff_blocks = gitea_client.get_diff_blocks(owner, repo, commit['sha'])
+            if not diff_blocks:
+                continue
 
-    diff_blocks = gitea_clinet.get_diff_blocks(owner, repo, sha)
-    if diff_blocks is None:
-        return {"message": "Failed to get diff content"}
-
-    current_issue_id = None
-
-    ignored_file_suffix = config.ignored_file_suffix.split(",")
-
-    for i, diff_content in enumerate(diff_blocks, start=1):
-        file_path = diff_content.split(" ")[0].split("/")
-        file_name = file_path[-1]
-
-        # Ignore the file if it's in the ignored list
-        if ignored_file_suffix:
-            for suffix in ignored_file_suffix:
-                if file_name.endswith(suffix):
-                    logger.warning(f"File {file_name} is ignored")
-                    continue
-
-        # 使用选定的 AI 实例进行代码审查
-        response = ai.code_review(diff_content)
-
-        comment = create_comment(file_name, diff_content, response)
-        if i == 1:
-            issue_res = gitea_clinet.create_issue(
-                owner,
-                repo,
-                f"Code Review {title}",
-                f"本次提交：{commit_url} \n\r 提交人：{pusher} \n\r {comment}",
-                ref,
-                pusher,
-            )
-            # 优先使用 html_url，如果没有则使用 url
-            issue_url = issue_res.get("html_url") or issue_res.get("url")
-            if not issue_url:
-                logger.error("Failed to get issue URL from response")
-                issue_url = f"{config.gitea_host}/Infrastructure/IaC/issues/{issue_res['number']}"
+            # 合并所有diff内容
+            combined_diff = "\n".join(diff_blocks)
             
-            current_issue_id = issue_res["number"]
+            # 使用AI进行代码审查
+            review_content = ai.code_review(combined_diff)
             
-            logger.success(f"The code review: {issue_url}")
+            # 解析审查结果
+            review_result = ai.parse_review_result(review_content)
+            # 添加commit信息
+            review_result.update({
+                'commit_sha': commit['sha'],
+                'commit_message': commit.get('commit', {}).get('message', ''),
+                'commit_url': commit.get('html_url', '')
+            })
+            all_reviews.append(review_result)
 
-            # Send a notification to the webhook
+        # 检查是否所有commit都通过审查
+        all_passed = all(not review['needs_review'] for review in all_reviews)
+        lowest_score = min(review['score'] for review in all_reviews) if all_reviews else 0
+        
+        # 使用最低分作为最终评审结果
+        final_review = {
+            'score': lowest_score,
+            'needs_review': not all_passed,
+            'issues': [],
+            'commit_reviews': [
+                {
+                    'sha': review['commit_sha'],
+                    'message': review['commit_message'],
+                    'url': review['commit_url'],
+                    'score': review['score'],
+                    'passed': not review['needs_review'],
+                    'issues': review.get('issues', [])
+                }
+                for review in all_reviews
+            ]
+        }
+        
+        # 收集所有未通过commit的问题并按commit分组
+        for review in all_reviews:
+            if review['needs_review']:
+                final_review['issues'].extend([
+                    {
+                        **issue,
+                        'commit_sha': review['commit_sha'],
+                        'commit_message': review['commit_message']
+                    }
+                    for issue in review.get('issues', [])
+                ])
+        
+        # 修改评论格式化方法以包含commit信息
+        gitea_client.add_pr_review_comment(owner, repo, pr_number, final_review)
+        
+        # 只有当所有commit都通过时才自动合并
+        if all_passed:
+            logger.info(f"PR #{pr_number} 所有commit都通过代码审查，尝试自动合并")
+            if gitea_client.merge_pr(owner, repo, pr_number):
+                merge_status = "已自动合并"
+            else:
+                merge_status = "自动合并失败"
+                
+            # 发送通知（如果配置了webhook）
             if config.webhook.is_init:
-                headers = {}
-                if config.webhook.header_name and config.webhook.header_value:
-                    headers = {config.webhook.header_name: config.webhook.header_value}
-
-                content = (
-                    f"Code Review: {title}\n{commit_url}\n\n审查结果: \n{issue_url}"
+                send_notification(
+                    f"PR #{pr_number} 代码审查通过 ({merge_status})\n"
+                    f"最低评分：{lowest_score}\n"
+                    f"标题：{pr_info['title']}\n"
+                    f"提交者：{pr_info['user']['login']}\n"
+                    f"链接：{pr_info['html_url']}"
                 )
-                request_body_str = config.webhook.request_body.format(
-                    content=content,
-                    mention=full_name,
-                )
-                request_body = json.loads(request_body_str, strict=False)
-                requests.post(
-                    config.webhook.url,
-                    headers=headers,
-                    json=request_body,
-                )
-
         else:
-            gitea_clinet.add_issue_comment(
-                owner,
-                repo,
-                current_issue_id,
-                comment,
-            )
+            logger.info(f"PR #{pr_number} 需要进一步审查，已添加评论")
+            
+        return {
+            "message": "Code review completed",
+            "pr_number": pr_number,
+            "title": pr_info['title'],
+            "submitter": pr_info['user']['login'],
+            "score": lowest_score,
+            "needs_review": not all_passed,
+            "commit_reviews": [
+                {
+                    "sha": review['commit_sha'],
+                    "score": review['score'],
+                    "passed": not review['needs_review']
+                }
+                for review in all_reviews
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"处理PR审查请求时发生错误: {str(e)}")
+        return {"error": str(e)}
 
-        logger.info("Sleep for 1.5 seconds...")
-        sleep(1.5)
+def send_notification(content: str):
+    """发送webhook通知"""
+    try:
+        headers = {}
+        if config.webhook.header_name and config.webhook.header_value:
+            headers = {config.webhook.header_name: config.webhook.header_value}
 
-    # 添加对应 AI 的横幅
-    gitea_clinet.add_issue_comment(
-        owner,
-        repo,
-        current_issue_id,
-        ai.banner,
-    )
-
-    return {"message": response}
-
+        request_body = json.loads(
+            config.webhook.request_body.format(content=content),
+            strict=False
+        )
+        
+        requests.post(
+            config.webhook.url,
+            headers=headers,
+            json=request_body,
+        )
+    except Exception as e:
+        logger.error(f"发送通知失败: {str(e)}")
 
 @app.post("/test")
 def test(request_body: str):
-    logger.success("Test")
-    return {"message": ai.code_review(request_body)}
-
+    """测试AI代码审查功能"""
+    logger.info("Testing code review")
+    review_content = ai.code_review(request_body)
+    review_result = ai.parse_review_result(review_content)
+    return review_result
 
 if __name__ == "__main__":
     import uvicorn
 
-    serv_config = uvicorn.Config(
-        "main:app",
-        host="0.0.0.0",
-        port=3008,
-        access_log=True,
-        workers=1,
-        reload=True,
-    )
-    server = uvicorn.Server(serv_config)
-
     setup_logging()
+    
+    server = uvicorn.Server(
+        uvicorn.Config(
+            "main:app",
+            host="0.0.0.0",
+            port=3008,
+            workers=1,
+            reload=True
+        )
+    )
     server.run()
