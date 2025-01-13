@@ -64,23 +64,55 @@ async def review_pull_request(request_body: Dict):
             # 获取commit的差异内容
             diff_blocks = gitea_client.get_diff_blocks(owner, repo, commit['sha'])
             if not diff_blocks:
+                logger.warning("未找到PR的diff信息")
                 continue
 
-            # 合并所有diff内容
-            combined_diff = "\n".join(diff_blocks)
-            
-            # 使用AI进行代码审查
-            review_content = ai.code_review(combined_diff)
-            
-            # 解析审查结果
-            review_result = ai.parse_review_result(review_content)
-            # 添加commit信息
-            review_result.update({
-                'commit_sha': commit['sha'],
-                'commit_message': commit.get('commit', {}).get('message', ''),
-                'commit_url': commit.get('html_url', '')
-            })
-            all_reviews.append(review_result)
+            # 处理每个diff块
+            for diff_block in diff_blocks:
+                # 解析文件路径和修改行号范围
+                parse_result = gitea_client.parse_diff_location(diff_block)
+                if not parse_result or not parse_result[0]:  # 检查文件路径是否存在
+                    continue
+                    
+                filepath, start_line, end_line, is_new_file, is_deleted = parse_result
+                
+                # 跳过二进制文件
+                if start_line == 0 and end_line == 0 and not is_new_file and not is_deleted:
+                    logger.info(f"跳过二进制文件: {filepath}")
+                    continue
+                
+                # 获取修改部分的上下文代码
+                context_content = gitea_client.get_file_content_around_diff(
+                    owner, repo, filepath, commit['sha'],
+                    start_line, end_line, context_lines=20,
+                    is_new_file=is_new_file, is_deleted=is_deleted
+                )
+                
+                # 准备文件状态信息
+                file_status = "新文件" if is_new_file else "删除" if is_deleted else "修改"
+                
+                # 使用AI进行代码审查
+                review_content = ai.code_review(
+                    diff_block,
+                    context_content=context_content,
+                    file_status=file_status
+                )
+                
+                try:
+                    # 解析审查结果
+                    review_result = ai.parse_review_result(review_content)
+                    # 添加文件和commit信息
+                    review_result.update({
+                        'filepath': filepath,
+                        'file_status': file_status,
+                        'commit_sha': commit['sha'],
+                        'commit_message': commit.get('commit', {}).get('message', ''),
+                        'commit_url': commit.get('html_url', '')
+                    })
+                    all_reviews.append(review_result)
+                except Exception as e:
+                    logger.error(f"解析审查结果失败: {str(e)}")
+                    continue
 
         # 检查是否所有commit都通过审查，且没有High或Critical级别的问题
         all_passed = all(not review['needs_review'] for review in all_reviews)

@@ -4,6 +4,7 @@ import requests
 from codereview.ai import AI
 from loguru import logger
 import re
+from typing import Optional
 
 
 class DeepSeek(AI):
@@ -15,9 +16,38 @@ class DeepSeek(AI):
         self.base_url = "https://api.deepseek.com"
         self.pass_score = int(os.getenv('DEEPSEEK_PASS_SCORE', 70))
 
-    def code_review(self, diff_content: str, model: str = "deepseek-chat") -> str:
-        """使用 DeepSeek AI 执行代码审查"""
-        review_prompt = f'''你是一个严格的高级代码审查专家。请仔细审查提供的代码差异，并按照以下维度进行严格评估：
+    def code_review(self, diff_content: str, context_content: Optional[str] = None, 
+                    file_status: str = "修改", model: str = "deepseek-chat") -> str:
+        """使用 DeepSeek AI 执行代码审查
+        
+        Args:
+            diff_content (str): git diff 内容
+            context_content (Optional[str]): 修改部分的上下文内容
+            file_status (str): 文件状态（新文件/修改/删除）
+            model (str): 使用的模型名称
+        """
+        context = f"文件状态: {file_status}\n\n"
+        
+        if context_content:
+            context += f'''
+以下是修改代码的上下文（包含修改部分上下20行的代码）：
+>>> 标记的是修改的部分
+... 标记的是上下文代码
+行号格式：前缀 行号: 代码内容
+
+```
+{context_content}
+```
+
+'''
+        elif file_status == "删除":
+            context += "该文件将被删除。\n\n"
+        elif file_status == "新文件":
+            context += "这是一个新创建的文件。\n\n"
+
+        review_prompt = f'''你是一个严格的高级代码审查专家。请结合上下文代码仔细审查提供的代码，并按照以下维度进行严格评估：
+
+{context}
 
 1. 代码质量
    - 代码可读性：函数长度（建议不超过100行），代码缩进，空行使用

@@ -281,3 +281,140 @@ class GiteaClient:
             if hasattr(e, 'response') and e.response is not None:
                 logger.error(f"错误响应: {e.response.text}")
             return False
+
+    def parse_diff_location(self, diff_block: str) -> tuple:
+        """从diff块中解析文件路径和修改的行号范围
+        
+        Args:
+            diff_block (str): git diff内容块
+            
+        Returns:
+            tuple: (filepath, start_line, end_line, is_new_file, is_deleted)
+        """
+        # 检查是否是新文件或删除的文件
+        is_new_file = "new file mode" in diff_block
+        is_deleted = "deleted file mode" in diff_block
+        
+        # 解析文件路径
+        file_path_match = re.search(r'a/(.+?) b/', diff_block)
+        if not file_path_match:
+            # 对于新文件，路径格式可能不同
+            new_file_match = re.search(r'b/(.+?)$', diff_block.split('\n')[0])
+            if new_file_match:
+                filepath = new_file_match.group(1)
+            else:
+                return None, 0, 0, False, False
+        else:
+            filepath = file_path_match.group(1)
+        
+        # 如果是二进制文件，直接返回
+        if "Binary files" in diff_block:
+            return filepath, 0, 0, is_new_file, is_deleted
+        
+        # 解析变更的行号范围
+        # 查找类似 @@ -1,7 +1,7 @@ 的行号信息
+        hunk_header_pattern = r'@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@'
+        hunk_matches = re.finditer(hunk_header_pattern, diff_block)
+        
+        start_line = float('inf')
+        end_line = 0
+        
+        for match in hunk_matches:
+            hunk_start = int(match.group(1))
+            hunk_length = int(match.group(2)) if match.group(2) else 1
+            
+            start_line = min(start_line, hunk_start)
+            end_line = max(end_line, hunk_start + hunk_length - 1)  # 修正结束行号计算
+        
+        if start_line == float('inf'):
+            start_line = 0
+            end_line = 0
+        
+        return filepath, start_line, end_line, is_new_file, is_deleted
+
+    def get_file_content_around_diff(self, owner: str, repo: str, filepath: str, ref: str, 
+                                   start_line: int, end_line: int, context_lines: int = 20,
+                                   is_new_file: bool = False, is_deleted: bool = False) -> Optional[str]:
+        """获取文件中指定行号周围的内容
+        
+        Args:
+            owner (str): 仓库所有者
+            repo (str): 仓库名称
+            filepath (str): 文件路径
+            ref (str): 分支或commit的引用
+            start_line (int): diff开始的行号
+            end_line (int): diff结束的行号
+            context_lines (int): 上下文行数
+            is_new_file (bool): 是否是新文件
+            is_deleted (bool): 是否是被删除的文件
+            
+        Returns:
+            Optional[str]: 包含上下文的代码片段
+        """
+        # 如果是删除的文件，不需要获取内容
+        if is_deleted:
+            return None
+        
+        endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/contents/{filepath}"
+        params = {"ref": ref}
+        
+        try:
+            response = requests.get(endpoint, headers=self.headers, params=params)
+            
+            # 处理404错误（文件不存在）
+            if response.status_code == 404:
+                if is_new_file:
+                    logger.info(f"文件 {filepath} 是新创建的文件")
+                    return None
+                else:
+                    logger.error(f"文件 {filepath} 不存在")
+                    return None
+                
+            response.raise_for_status()
+            content = response.json().get("content")
+            
+            # 检查文件内容是否为空
+            if not content:
+                logger.warning(f"文件 {filepath} 内容为空")
+                return None
+            
+            # 检查是否是二进制文件
+            try:
+                file_content = base64.b64decode(content).decode('utf-8')
+            except UnicodeDecodeError:
+                logger.warning(f"文件 {filepath} 可能是二进制文件")
+                return None
+            
+            # 将文件内容分割成行
+            lines = file_content.splitlines()
+            
+            # 如果是新文件，显示所有内容
+            if is_new_file:
+                return "\n".join(f">>> {line}" for line in lines)
+            
+            # 计算需要展示的行范围
+            context_start = max(0, start_line - context_lines - 1)
+            context_end = min(len(lines), end_line + context_lines)
+            
+            # 提取相关行并添加行号注释
+            context_lines = []
+            for i in range(context_start, context_end):
+                line_number = i + 1  # 实际行号（从1开始）
+                prefix = "    "  # 普通行使用4个空格缩进
+                if i < start_line - 1:
+                    prefix = "... "  # 上文使用省略号
+                elif i >= end_line:
+                    prefix = "... "  # 下文使用省略号
+                else:
+                    prefix = ">>> "  # diff范围内的行使用箭头标记
+                    
+                context_lines.append(f"{prefix}{line_number}: {lines[i]}")
+            
+            return "\n".join(context_lines)
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"获取文件内容失败: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"处理文件内容时发生错误: {str(e)}")
+            return None
