@@ -82,46 +82,22 @@ async def review_pull_request(request_body: Dict):
             })
             all_reviews.append(review_result)
 
-        # 检查是否所有commit都通过审查
+        # 检查是否所有commit都通过审查，且没有High或Critical级别的问题
         all_passed = all(not review['needs_review'] for review in all_reviews)
+        has_high_severity_issues = any(
+            any(
+                problem['severity'] in ['High', 'Critical']
+                for issue in review.get('issues', [])
+                for problem in issue.get('problems', [])
+            )
+            for review in all_reviews
+        )
+        
         lowest_score = min(review['score'] for review in all_reviews) if all_reviews else 0
         
-        # 使用最低分作为最终评审结果
-        final_review = {
-            'score': lowest_score,
-            'needs_review': not all_passed,
-            'issues': [],
-            'commit_reviews': [
-                {
-                    'sha': review['commit_sha'],
-                    'message': review['commit_message'],
-                    'url': review['commit_url'],
-                    'score': review['score'],
-                    'passed': not review['needs_review'],
-                    'issues': review.get('issues', [])
-                }
-                for review in all_reviews
-            ]
-        }
-        
-        # 收集所有未通过commit的问题并按commit分组
-        for review in all_reviews:
-            if review['needs_review']:
-                final_review['issues'].extend([
-                    {
-                        **issue,
-                        'commit_sha': review['commit_sha'],
-                        'commit_message': review['commit_message']
-                    }
-                    for issue in review.get('issues', [])
-                ])
-        
-        # 修改评论格式化方法以包含commit信息
-        gitea_client.add_pr_review_comment(owner, repo, pr_number, final_review)
-        
-        # 只有当所有commit都通过时才自动合并
-        if all_passed:
-            logger.info(f"PR #{pr_number} 所有commit都通过代码审查，尝试自动合并")
+        # 修改自动合并的条件
+        if all_passed and not has_high_severity_issues:
+            logger.info(f"PR #{pr_number} 通过代码审查且无严重问题，尝试自动合并")
             if gitea_client.merge_pr(owner, repo, pr_number):
                 merge_status = "已自动合并"
             else:
@@ -131,14 +107,15 @@ async def review_pull_request(request_body: Dict):
             if config.webhook.is_init:
                 send_notification(
                     f"PR #{pr_number} 代码审查通过 ({merge_status})\n"
-                    f"最低评分：{lowest_score}\n"
+                    f"评分：{lowest_score}\n"
                     f"标题：{pr_info['title']}\n"
                     f"提交者：{pr_info['user']['login']}\n"
                     f"链接：{pr_info['html_url']}"
                 )
         else:
-            logger.info(f"PR #{pr_number} 需要进一步审查，已添加评论")
-            
+            reason = "需要进一步审查" if not all_passed else "存在严重问题"
+            logger.info(f"PR #{pr_number} {reason}，已添加评论")
+
         return {
             "message": "Code review completed",
             "pr_number": pr_number,
