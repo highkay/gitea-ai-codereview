@@ -251,11 +251,23 @@ class GiteaClient:
         Returns:
             bool: 是否成功
         """
+        # 在合并之前检查PR状态
+        pr_endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}"
+        pr_response = requests.get(pr_endpoint, headers=self.headers)
+        pr_info = pr_response.json()
+
+        if not pr_info.get('mergeable'):
+            logger.error(f"PR #{pr_number} 当前无法合并")
+            return False
+
         endpoint = f"{self.host}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/merge"
+        
+        # 根据API文档,需要提供合并选项
         data = {
-            "Do": "merge",  # 合并方式：merge, rebase, squash, rebase-merge
-            "MergeTitleField": "Merge pull request #{pr_number}",
+            "Do": "merge",  # 可选值: merge, rebase, rebase-merge, squash
             "MergeMessageField": "Automatically merged by code review bot",
+            "MergeTitleField": f"Merge pull request #{pr_number}",
+            "force_merge": True  # 添加force_merge选项
         }
         
         try:
@@ -265,4 +277,7 @@ class GiteaClient:
             return True
         except Exception as e:
             logger.error(f"合并PR失败: {str(e)}")
+            # 添加更详细的错误日志
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"错误响应: {e.response.text}")
             return False
